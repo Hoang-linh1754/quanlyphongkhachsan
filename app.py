@@ -1,1040 +1,453 @@
-
 import os
 import sqlite3
 import uuid
 from datetime import date, datetime, timedelta
 
-import pandas as pd
 import streamlit as st
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
+DB_PATH = "hotel.db"
+HOTEL_NAME = "Khách sạn Demo"
+STAFF_USER = os.getenv("HOTEL_STAFF_USER", "admin")
+STAFF_PASSWORD = os.getenv("HOTEL_STAFF_PASSWORD", "123456")
 
-
-# =========================================================
-# 1. CẤU HÌNH
-# =========================================================
-
-st.set_page_config(
-    page_title="Hotel Booking",
-    page_icon="🏨",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-DB_NAME = "hotel.db"
-
-STATUSES = [
-    "Chờ xác nhận",
-    "Đã xác nhận",
-    "Đã hủy",
-    "Đã từ chối",
-    "Đã hoàn tất",
-]
-
-ROOM_STATUSES = ["Trống", "Có khách", "Đang dọn", "Bảo trì"]
-
-ROOM_COLORS = {
-    "Trống": "#16a34a",
-    "Có khách": "#2563eb",
-    "Đang dọn": "#d97706",
-    "Bảo trì": "#dc2626",
+ROOM_TYPES = {
+    "Standard": {"price": 500_000, "capacity": 2, "description": "Phòng tiêu chuẩn, 1 giường đôi"},
+    "Deluxe": {"price": 800_000, "capacity": 2, "description": "Phòng cao cấp, có cửa sổ"},
+    "Family": {"price": 1_200_000, "capacity": 4, "description": "Phòng gia đình, rộng rãi"},
+    "Suite": {"price": 1_800_000, "capacity": 2, "description": "Phòng Suite cao cấp"},
 }
 
-STAFF_PASSWORD = os.getenv("STAFF_PASSWORD", "123456")
-
-
-# =========================================================
-# 2. DATABASE
-# =========================================================
-
-def db():
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
-
 def init_db():
-    conn = db()
-
-    conn.execute("""
+    with get_conn() as conn:
+        conn.executescript("""
         CREATE TABLE IF NOT EXISTS rooms (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             room_number TEXT UNIQUE NOT NULL,
             room_type TEXT NOT NULL,
-            floor INTEGER NOT NULL DEFAULT 1,
-            capacity INTEGER NOT NULL DEFAULT 2,
-            price REAL NOT NULL DEFAULT 0,
-            description TEXT DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'Trống',
-            active INTEGER NOT NULL DEFAULT 1
-        )
-    """)
-
-    conn.execute("""
+            price INTEGER NOT NULL,
+            capacity INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Trống'
+        );
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL,
+            booking_code TEXT UNIQUE NOT NULL,
             customer_name TEXT NOT NULL,
             phone TEXT NOT NULL,
-            email TEXT DEFAULT '',
+            email TEXT,
             room_id INTEGER NOT NULL,
             checkin TEXT NOT NULL,
             checkout TEXT NOT NULL,
             guests INTEGER NOT NULL,
             nights INTEGER NOT NULL,
-            total REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'Chờ xác nhận',
-            note TEXT DEFAULT '',
+            total INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Đã xác nhận',
+            payment_status TEXT NOT NULL DEFAULT 'Chưa thanh toán',
             created_at TEXT NOT NULL,
-            FOREIGN KEY (room_id) REFERENCES rooms(id)
-        )
-    """)
-
-    conn.execute("""
+            FOREIGN KEY(room_id) REFERENCES rooms(id)
+        );
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT NOT NULL,
+            booking_code TEXT NOT NULL,
             sender TEXT NOT NULL,
-            sender_name TEXT NOT NULL,
             message TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (code) REFERENCES bookings(code)
-        )
-    """)
-
-    # Tạo dữ liệu phòng mẫu nếu database chưa có phòng.
-    count = conn.execute(
-        "SELECT COUNT(*) FROM rooms"
-    ).fetchone()[0]
-
-    if count == 0:
-        sample_rooms = [
-            ("101", "Phòng đơn", 1, 1, 350000,
-             "Phòng đơn tiện nghi dành cho 1 khách.", "Trống"),
-            ("102", "Phòng đôi", 1, 2, 500000,
-             "Phòng đôi rộng rãi dành cho 2 khách.", "Có khách"),
-            ("103", "Phòng VIP", 1, 2, 900000,
-             "Phòng VIP tiện nghi cao cấp.", "Đang dọn"),
-            ("201", "Phòng gia đình", 2, 4, 1200000,
-             "Phòng gia đình phù hợp tối đa 4 khách.", "Trống"),
-            ("202", "Phòng Deluxe", 2, 2, 750000,
-             "Phòng Deluxe có không gian thoải mái.", "Có khách"),
-            ("203", "Phòng đôi", 2, 2, 550000,
-             "Phòng đôi đang được bảo trì.", "Bảo trì"),
-        ]
-
-        conn.executemany("""
-            INSERT INTO rooms (
-                room_number, room_type, floor, capacity,
-                price, description, status
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, sample_rooms)
-
-    conn.commit()
-    conn.close()
-
-
-def get_rooms():
-    conn = db()
-    data = pd.read_sql_query("""
-        SELECT *
-        FROM rooms
-        WHERE active = 1
-        ORDER BY floor, room_number
-    """, conn)
-    conn.close()
-    return data
-
-
-def get_bookings():
-    conn = db()
-    data = pd.read_sql_query("""
-        SELECT
-            b.*,
-            r.room_number,
-            r.room_type,
-            r.floor,
-            r.capacity,
-            r.price
-        FROM bookings b
-        JOIN rooms r ON r.id = b.room_id
-        ORDER BY b.created_at DESC
-    """, conn)
-    conn.close()
-    return data
-
-
-def get_booking(code):
-    conn = db()
-    row = conn.execute("""
-        SELECT b.*, r.room_number, r.room_type, r.floor, r.price
-        FROM bookings b
-        JOIN rooms r ON r.id = b.room_id
-        WHERE b.code = ?
-    """, (code.strip().upper(),)).fetchone()
-    conn.close()
-    return row
-
-
-# =========================================================
-# 3. KIỂM TRA PHÒNG TRỐNG THEO NGÀY
-# =========================================================
-
-def find_available_rooms(checkin, checkout, guests):
-    """
-    Phòng được xem là đã có lịch đặt nếu có đơn đang chờ
-    xác nhận hoặc đã xác nhận bị trùng thời gian lưu trú.
-    """
-
-    conn = db()
-
-    rows = conn.execute("""
-        SELECT *
-        FROM rooms
-        WHERE active = 1
-          AND status != 'Bảo trì'
-          AND capacity >= ?
-          AND id NOT IN (
-              SELECT room_id
-              FROM bookings
-              WHERE status IN ('Chờ xác nhận', 'Đã xác nhận')
-                AND checkin < ?
-                AND checkout > ?
-          )
-        ORDER BY price ASC
-    """, (
-        guests,
-        checkout.isoformat(),
-        checkin.isoformat(),
-    )).fetchall()
-
-    conn.close()
-    return rows
-
-
-# =========================================================
-# 4. TẠO ĐẶT PHÒNG
-# =========================================================
-
-def create_booking(
-    customer_name, phone, email, room_id,
-    checkin, checkout, guests, note
-):
-    if checkout <= checkin:
-        return False, "Ngày trả phòng phải sau ngày nhận phòng."
-
-    nights = (checkout - checkin).days
-    conn = db()
-
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-
-        room = conn.execute("""
-            SELECT *
-            FROM rooms
-            WHERE id = ? AND active = 1
-        """, (room_id,)).fetchone()
-
-        if room is None:
-            conn.rollback()
-            return False, "Phòng không tồn tại."
-
-        if room["status"] == "Bảo trì":
-            conn.rollback()
-            return False, "Phòng đang bảo trì."
-
-        if guests > room["capacity"]:
-            conn.rollback()
-            return False, "Số khách vượt quá sức chứa của phòng."
-
-        overlap = conn.execute("""
-            SELECT COUNT(*)
-            FROM bookings
-            WHERE room_id = ?
-              AND status IN ('Chờ xác nhận', 'Đã xác nhận')
-              AND checkin < ?
-              AND checkout > ?
-        """, (
-            room_id,
-            checkout.isoformat(),
-            checkin.isoformat(),
-        )).fetchone()[0]
-
-        if overlap:
-            conn.rollback()
-            return False, "Phòng đã được đặt trong khoảng ngày này."
-
-        code = (
-            "BK" + datetime.now().strftime("%y%m%d")
-            + uuid.uuid4().hex[:6].upper()
-        )
-
-        total = float(room["price"]) * nights
-
-        conn.execute("""
-            INSERT INTO bookings (
-                code, customer_name, phone, email,
-                room_id, checkin, checkout, guests,
-                nights, total, status, note, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            code, customer_name.strip(), phone.strip(),
-            email.strip(), room_id, checkin.isoformat(),
-            checkout.isoformat(), guests, nights, total,
-            "Chờ xác nhận", note.strip(),
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ))
-
-        conn.commit()
-        return True, code
-
-    except Exception as e:
-        conn.rollback()
-        return False, f"Lỗi tạo đặt phòng: {e}"
-
-    finally:
-        conn.close()
-
-
-# =========================================================
-# 5. CẬP NHẬT TRẠNG THÁI ĐƠN
-# =========================================================
-
-def update_booking_status(code, new_status):
-    if new_status not in STATUSES:
-        return False, "Trạng thái không hợp lệ."
-
-    conn = db()
-
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-
-        booking = conn.execute(
-            "SELECT * FROM bookings WHERE code = ?",
-            (code,),
-        ).fetchone()
-
-        if booking is None:
-            conn.rollback()
-            return False, "Không tìm thấy đơn đặt phòng."
-
-        if new_status == "Đã xác nhận":
-            overlap = conn.execute("""
-                SELECT COUNT(*)
-                FROM bookings
-                WHERE room_id = ?
-                  AND code != ?
-                  AND status IN ('Chờ xác nhận', 'Đã xác nhận')
-                  AND checkin < ?
-                  AND checkout > ?
-            """, (
-                booking["room_id"],
-                code,
-                booking["checkout"],
-                booking["checkin"],
-            )).fetchone()[0]
-
-            if overlap:
-                conn.rollback()
-                return False, "Phòng đã có đơn trùng ngày."
-
-        conn.execute("""
-            UPDATE bookings
-            SET status = ?
-            WHERE code = ?
-        """, (new_status, code))
-
-        conn.commit()
-        return True, "Cập nhật trạng thái thành công."
-
-    except Exception as e:
-        conn.rollback()
-        return False, str(e)
-
-    finally:
-        conn.close()
-
-
-# =========================================================
-# 6. CHAT KHÁCH HÀNG VÀ NHÂN VIÊN
-# =========================================================
-
-def get_messages(code):
-    conn = db()
-    rows = conn.execute("""
-        SELECT *
-        FROM messages
-        WHERE code = ?
-        ORDER BY id ASC
-    """, (code.strip().upper(),)).fetchall()
-    conn.close()
-    return rows
-
-
-def save_message(code, sender, sender_name, message):
-    message = message.strip()
-
-    if not message:
-        return False
-
-    conn = db()
-
-    exists = conn.execute(
-        "SELECT 1 FROM bookings WHERE code = ?",
-        (code.strip().upper(),),
-    ).fetchone()
-
-    if not exists:
-        conn.close()
-        return False
-
-    conn.execute("""
-        INSERT INTO messages (
-            code, sender, sender_name, message, created_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        code.strip().upper(),
-        sender,
-        sender_name,
-        message,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    ))
-
-    conn.commit()
-    conn.close()
-    return True
-
-
-def chat_interface(code, sender, sender_name):
-    st.subheader("💬 Tin nhắn")
-
-    messages = get_messages(code)
-
-    if not messages:
-        st.info("Chưa có tin nhắn. Hãy gửi lời nhắn đầu tiên.")
-
-    for msg in messages:
-        role = "assistant" if msg["sender"] != sender else "user"
-
-        with st.chat_message(role):
-            st.caption(
-                f"{msg['sender_name']} · {msg['created_at']}"
-            )
-            st.markdown(msg["message"])
-
-    with st.form(f"chat_{sender}_{code}", clear_on_submit=True):
-        message = st.text_input(
-            "Nội dung tin nhắn",
-            placeholder="Nhập tin nhắn...",
-        )
-        submitted = st.form_submit_button(
-            "📨 Gửi tin nhắn",
-            use_container_width=True,
-        )
-
-        if submitted:
-            if save_message(code, sender, sender_name, message):
-                st.rerun()
-            else:
-                st.error("Không gửi được tin nhắn.")
-
-
-# =========================================================
-# 7. CHATBOX AI
-# =========================================================
-
-def get_api_key():
-    try:
-        key = st.secrets.get("OPENAI_API_KEY", "")
-        if key:
-            return key
-    except Exception:
-        pass
-
-    return os.getenv("OPENAI_API_KEY", "")
-
-
-def get_ai_client():
-    key = get_api_key()
-
-    if not key or OpenAI is None:
-        return None
-
-    try:
-        return OpenAI(api_key=key)
-    except Exception:
-        return None
-
-
-def ai_answer(question):
-    rooms = get_rooms()
-
-    if rooms.empty:
-        context = "Khách sạn chưa có dữ liệu phòng."
-    else:
-        context = "\n".join([
-            f"Phòng {r['room_number']}: {r['room_type']}; "
-            f"sức chứa {r['capacity']} người; "
-            f"giá {r['price']:,.0f} VNĐ/đêm; "
-            f"trạng thái hiện tại: {r['status']}; "
-            f"{r['description']}"
-            for _, r in rooms.iterrows()
-        ])
-
-    client = get_ai_client()
-
-    if client is None:
-        q = question.lower()
-
-        if any(w in q for w in ["giá", "phòng", "loại phòng"]):
-            return (
-                "Thông tin phòng hiện có:\n\n"
-                + context
-                + "\n\nĐể kiểm tra phòng trống theo ngày, "
-                "vui lòng vào mục Đặt phòng."
-            )
-
-        return (
-            "Xin chào! Tôi là trợ lý khách sạn. "
-            "Bạn có thể hỏi về loại phòng, giá phòng hoặc "
-            "cách đặt phòng. Đây là chế độ minh họa chưa kết nối AI."
-        )
-
-    system_prompt = f"""
-Bạn là trợ lý chăm sóc khách hàng khách sạn.
-Trả lời bằng tiếng Việt, lịch sự, ngắn gọn.
-Chỉ sử dụng dữ liệu bên dưới để tư vấn loại phòng và giá.
-Không tự xác nhận đặt phòng hoặc cam kết phòng còn trống.
-Hướng dẫn khách vào mục Đặt phòng để kiểm tra ngày cụ thể.
-Không bịa thông tin.
-
-DỮ LIỆU PHÒNG:
-{context}
-"""
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": question},
-            ],
-            temperature=0.3,
-        )
-        return response.choices[0].message.content or "AI chưa có câu trả lời."
-
-    except Exception:
-        return (
-            "Không thể kết nối AI lúc này. "
-            "Vui lòng thử lại hoặc liên hệ nhân viên."
-        )
-
-
-# =========================================================
-# 8. HÀM HIỂN THỊ
-# =========================================================
+            created_at TEXT NOT NULL
+        );
+        """)
+        count = conn.execute("SELECT COUNT(*) FROM rooms").fetchone()[0]
+        if count == 0:
+            rooms = [
+                ("101", "Standard"), ("102", "Standard"), ("103", "Standard"),
+                ("201", "Deluxe"), ("202", "Deluxe"), ("203", "Deluxe"),
+                ("301", "Family"), ("302", "Family"),
+                ("401", "Suite"), ("402", "Suite"),
+                ("501", "Standard"), ("502", "Deluxe"),
+            ]
+            for number, kind in rooms:
+                info = ROOM_TYPES[kind]
+                conn.execute(
+                    "INSERT INTO rooms(room_number, room_type, price, capacity, status) VALUES(?,?,?,?,?)",
+                    (number, kind, info["price"], info["capacity"], "Trống")
+                )
+
+            # 4 booking mẫu: 2 đang lưu trú, 2 đặt trước; 3 đã thanh toán.
+            today = date.today()
+            samples = [
+                ("KHACH001", "Nguyễn Văn An", "0901234567", "an@example.com", "101", today, today + timedelta(days=2), 2, "Đang ở", "Đã thanh toán"),
+                ("KHACH002", "Trần Thị Bình", "0912345678", "binh@example.com", "201", today, today + timedelta(days=3), 2, "Đang ở", "Đã thanh toán"),
+                ("KHACH003", "Lê Minh Cường", "0987654321", "cuong@example.com", "301", today + timedelta(days=2), today + timedelta(days=4), 4, "Đã xác nhận", "Đã thanh toán"),
+                ("KHACH004", "Phạm Thu Hà", "0934567890", "ha@example.com", "401", today + timedelta(days=3), today + timedelta(days=5), 2, "Đã xác nhận", "Chưa thanh toán"),
+            ]
+            for code, name, phone, email, room_no, ci, co, guests, status, payment in samples:
+                room = conn.execute("SELECT * FROM rooms WHERE room_number=?", (room_no,)).fetchone()
+                nights = (co - ci).days
+                total = room["price"] * nights
+                conn.execute("""
+                    INSERT INTO bookings(booking_code, customer_name, phone, email, room_id,
+                    checkin, checkout, guests, nights, total, status, payment_status, created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (code, name, phone, email, room["id"], ci.isoformat(), co.isoformat(),
+                      guests, nights, total, status, payment, datetime.now().isoformat(timespec="seconds")))
+                room_status = "Đang có khách" if status == "Đang ở" else "Đã đặt"
+                conn.execute("UPDATE rooms SET status=? WHERE id=?", (room_status, room["id"]))
 
 def money(value):
-    return f"{float(value):,.0f} VNĐ".replace(",", ".")
+    return f"{int(value):,}".replace(",", ".") + " đ"
 
-
-def show_booking(booking):
-    st.markdown(f"### 🧾 Mã đặt phòng: {booking['code']}")
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.write(f"**Khách hàng:** {booking['customer_name']}")
-        st.write(f"**Điện thoại:** {booking['phone']}")
-        st.write(f"**Phòng:** {booking['room_number']} - {booking['room_type']}")
-
-    with c2:
-        st.write(f"**Nhận phòng:** {booking['checkin']}")
-        st.write(f"**Trả phòng:** {booking['checkout']}")
-        st.write(f"**Số đêm:** {booking['nights']}")
-        st.write(f"**Số khách:** {booking['guests']}")
-
-    st.write(f"**Tổng tiền:** {money(booking['total'])}")
-    st.write(f"**Trạng thái:** {booking['status']}")
-
-
-# =========================================================
-# 9. KHỞI TẠO
-# =========================================================
-
-init_db()
-
-if "staff_logged_in" not in st.session_state:
-    st.session_state.staff_logged_in = False
-
-if "customer_chat_code" not in st.session_state:
-    st.session_state.customer_chat_code = ""
-
-if "ai_history" not in st.session_state:
-    st.session_state.ai_history = []
-
-
-# =========================================================
-# 10. MENU
-# =========================================================
-
-with st.sidebar:
-    st.title("🏨 HOTEL BOOKING")
-
-    page = st.radio(
-        "MENU CHÍNH",
-        [
-            "🏠 Trang chủ",
-            "🗺️ Sơ đồ phòng",
-            "🛏️ Đặt phòng",
-            "🔎 Tra cứu đặt phòng",
-            "💬 Chat với nhân viên",
-            "🤖 Chatbox AI",
-            "👨‍💼 Quản lý nhân viên",
-        ],
-    )
-
-    st.divider()
-    st.caption("Hệ thống đặt phòng khách sạn")
-
-
-# =========================================================
-# 11. TRANG CHỦ
-# =========================================================
-
-if page == "🏠 Trang chủ":
-    st.title("🏨 Chào mừng đến với khách sạn")
-
-    st.write(
-        "Đặt phòng trực tuyến, xem sơ đồ phòng và trò chuyện "
-        "với nhân viên hoặc trợ lý AI."
-    )
-
-    rooms = get_rooms()
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Tổng số phòng", len(rooms))
-    c2.metric(
-        "Phòng trống",
-        int((rooms["status"] == "Trống").sum()) if not rooms.empty else 0,
-    )
-    c3.metric(
-        "Phòng có khách",
-        int((rooms["status"] == "Có khách").sum()) if not rooms.empty else 0,
-    )
-
-    st.divider()
-    st.subheader("🛏️ Phòng khách sạn")
-
-    cols = st.columns(3)
-
-    for i, (_, room) in enumerate(rooms.iterrows()):
-        with cols[i % 3]:
-            with st.container(border=True):
-                st.subheader(f"Phòng {room['room_number']}")
-                st.write(f"**{room['room_type']}**")
-                st.write(f"Sức chứa: {room['capacity']} người")
-                st.write(f"Giá: **{money(room['price'])}/đêm**")
-                st.write(f"Trạng thái: **{room['status']}**")
-                st.caption(room["description"])
-
-
-# =========================================================
-# 12. SƠ ĐỒ PHÒNG
-# =========================================================
-
-elif page == "🗺️ Sơ đồ phòng":
-    st.title("🗺️ Sơ đồ phòng khách sạn")
-
-    st.markdown(
-        "🟢 Trống　🔵 Có khách　🟠 Đang dọn　🔴 Bảo trì"
-    )
-
-    rooms = get_rooms()
-
-    if rooms.empty:
-        st.info("Chưa có phòng.")
-    else:
-        floors = sorted(rooms["floor"].unique())
-
-        for floor in floors:
-            st.subheader(f"🏢 Tầng {floor}")
-            floor_rooms = rooms[rooms["floor"] == floor]
-            cols = st.columns(4)
-
-            for i, (_, room) in enumerate(floor_rooms.iterrows()):
-                color = ROOM_COLORS.get(room["status"], "#64748b")
-
-                with cols[i % 4]:
-                    st.markdown(
-                        f"""
-                        <div style="
-                            border:1px solid #e2e8f0;
-                            border-top:6px solid {color};
-                            border-radius:12px;
-                            padding:16px;
-                            margin-bottom:12px;
-                            background:#ffffff;
-                            color:#0f172a;
-                        ">
-                            <h2 style="margin:0">🚪 {room['room_number']}</h2>
-                            <b>{room['room_type']}</b>
-                            <p style="color:{color};font-weight:bold">
-                                {room['status']}
-                            </p>
-                            <p>Sức chứa: {room['capacity']} người</p>
-                            <p>Giá: {money(room['price'])}/đêm</p>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-
-# =========================================================
-# 13. ĐẶT PHÒNG
-# =========================================================
-
-elif page == "🛏️ Đặt phòng":
-    st.title("🛏️ Đặt phòng khách sạn")
-
-    with st.form("booking_form"):
-        st.subheader("Thông tin lưu trú")
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            checkin = st.date_input(
-                "Ngày nhận phòng",
-                value=date.today() + timedelta(days=1),
-                min_value=date.today(),
-            )
-
-        with c2:
-            checkout = st.date_input(
-                "Ngày trả phòng",
-                value=date.today() + timedelta(days=2),
-                min_value=date.today() + timedelta(days=1),
-            )
-
-        guests = st.number_input(
-            "Số khách",
-            min_value=1,
-            max_value=20,
-            value=2,
+def available_rooms(checkin, checkout, room_type=None, guests=1):
+    with get_conn() as conn:
+        sql = """
+        SELECT r.* FROM rooms r
+        WHERE r.capacity >= ?
+        AND r.id NOT IN (
+            SELECT b.room_id FROM bookings b
+            WHERE b.status IN ('Đã xác nhận','Đang ở')
+              AND date(b.checkin) < date(?)
+              AND date(b.checkout) > date(?)
         )
+        """
+        params = [guests, checkout.isoformat(), checkin.isoformat()]
+        if room_type and room_type != "Tất cả":
+            sql += " AND r.room_type=?"
+            params.append(room_type)
+        sql += " ORDER BY r.room_number"
+        return conn.execute(sql, params).fetchall()
 
-        st.subheader("Thông tin khách hàng")
+def create_booking(name, phone, email, room_id, checkin, checkout, guests):
+    with get_conn() as conn:
+        room = conn.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
+        if not room:
+            raise ValueError("Không tìm thấy phòng.")
+        conflict = conn.execute("""
+            SELECT COUNT(*) FROM bookings
+            WHERE room_id=? AND status IN ('Đã xác nhận','Đang ở')
+              AND date(checkin) < date(?) AND date(checkout) > date(?)
+        """, (room_id, checkout.isoformat(), checkin.isoformat())).fetchone()[0]
+        if conflict:
+            raise ValueError("Phòng vừa được đặt trong khoảng thời gian này. Vui lòng chọn phòng khác.")
+        nights = (checkout - checkin).days
+        code = "BK" + uuid.uuid4().hex[:8].upper()
+        total = room["price"] * nights
+        conn.execute("""
+            INSERT INTO bookings(booking_code, customer_name, phone, email, room_id, checkin,
+            checkout, guests, nights, total, status, payment_status, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (code, name.strip(), phone.strip(), email.strip(), room_id, checkin.isoformat(),
+              checkout.isoformat(), guests, nights, total, "Đã xác nhận", "Chưa thanh toán",
+              datetime.now().isoformat(timespec="seconds")))
+        conn.execute("UPDATE rooms SET status='Đã đặt' WHERE id=?", (room_id,))
+        return code, total
 
-        customer_name = st.text_input("Họ và tên *")
-        phone = st.text_input("Số điện thoại *")
-        email = st.text_input("Email")
-        note = st.text_area("Yêu cầu đặc biệt")
+def fetch_bookings():
+    with get_conn() as conn:
+        return conn.execute("""
+            SELECT b.*, r.room_number, r.room_type FROM bookings b
+            JOIN rooms r ON r.id=b.room_id ORDER BY b.id DESC
+        """).fetchall()
 
-        submitted = st.form_submit_button(
-            "🔍 Tìm phòng phù hợp",
-            use_container_width=True,
-        )
-
-    if submitted:
-        if not customer_name.strip() or not phone.strip():
-            st.error("Vui lòng nhập họ tên và số điện thoại.")
-        elif checkout <= checkin:
-            st.error("Ngày trả phòng phải sau ngày nhận phòng.")
-        else:
-            rooms_available = find_available_rooms(
-                checkin, checkout, int(guests)
-            )
-
-            if not rooms_available:
-                st.warning(
-                    "Không có phòng phù hợp trong khoảng ngày đã chọn."
-                )
+def refresh_room_statuses():
+    # Trạng thái tổng quan dựa trên các lượt lưu trú hiện tại và đặt trước.
+    today = date.today().isoformat()
+    with get_conn() as conn:
+        rooms = conn.execute("SELECT id FROM rooms").fetchall()
+        for room in rooms:
+            active = conn.execute("""
+                SELECT status, checkin, checkout FROM bookings
+                WHERE room_id=? AND status IN ('Đã xác nhận','Đang ở')
+                AND date(checkin) <= date(?) AND date(checkout) > date(?)
+                ORDER BY CASE status WHEN 'Đang ở' THEN 0 ELSE 1 END LIMIT 1
+            """, (room["id"], today, today)).fetchone()
+            if active:
+                status = "Đang có khách" if active["status"] == "Đang ở" else "Đã đặt"
             else:
-                st.success(f"Tìm thấy {len(rooms_available)} phòng.")
+                status = "Trống"
+            conn.execute("UPDATE rooms SET status=? WHERE id=?", (status, room["id"]))
 
-                options = {
-                    (
-                        f"Phòng {r['room_number']} - {r['room_type']} | "
-                        f"{money(r['price'])}/đêm | "
-                        f"Tối đa {r['capacity']} khách"
-                    ): r
-                    for r in rooms_available
+def ai_reply(question):
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if api_key:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": f"""Bạn là trợ lý tư vấn của {HOTEL_NAME}.
+Trả lời bằng tiếng Việt, lịch sự, ngắn gọn. Bảng giá tham khảo: """ +
+                     "; ".join(f"{k}: {money(v['price'])}/đêm, tối đa {v['capacity']} khách" for k, v in ROOM_TYPES.items()) +
+                     ". Không tự khẳng định phòng còn trống; hướng dẫn khách kiểm tra mục Đặt phòng."},
+                    {"role": "user", "content": question}
+                ],
+                temperature=0.5,
+            )
+            return response.choices[0].message.content or "Xin lỗi, tôi chưa có câu trả lời."
+        except Exception as exc:
+            return f"Không kết nối được AI ( {exc} ). Bạn có thể hỏi về giá phòng hoặc cách đặt phòng."
+    q = question.lower()
+    if any(x in q for x in ["giá", "bao nhiêu", "phòng"]):
+        return "Bảng giá theo đêm:\n" + "\n".join(
+            f"• {k}: {money(v['price'])} — tối đa {v['capacity']} khách. {v['description']}"
+            for k, v in ROOM_TYPES.items()
+        ) + "\n\nBạn có thể kiểm tra ngày còn phòng tại mục **Đặt phòng**."
+    if any(x in q for x in ["đặt", "booking", "đặt phòng"]):
+        return "Bạn vào mục **Đặt phòng**, nhập thông tin và chọn ngày nhận/trả phòng. Hệ thống sẽ hiển thị phòng còn trống và tổng tiền."
+    if any(x in q for x in ["check-in", "nhận phòng", "trả phòng", "check-out"]):
+        return "Bạn vui lòng cung cấp mã đặt phòng trong khung **Chat với nhân viên** để được hỗ trợ về thời gian nhận/trả phòng."
+    return "Xin chào! Tôi có thể tư vấn giá phòng, loại phòng và hướng dẫn đặt phòng. Bạn muốn tìm hiểu nội dung nào?"
+
+def main():
+    st.set_page_config(page_title="Quản lý khách sạn", page_icon="🏨", layout="wide")
+    init_db()
+    refresh_room_statuses()
+    st.title("🏨 Hệ thống đặt phòng khách sạn")
+    st.caption("Demo Streamlit • Dữ liệu lưu trong SQLite (hotel.db)")
+
+    with st.sidebar:
+        st.header("Điều hướng")
+        page = st.radio("Chọn chức năng", [
+            "Tổng quan", "Đặt phòng", "Sơ đồ phòng",
+            "Thông tin đặt phòng", "Chat với AI", "Chat với nhân viên", "Quản trị nhân viên"
+        ])
+        st.divider()
+        st.markdown("**Tài khoản nhân viên demo**")
+        st.code(f"Tài khoản: {STAFF_USER}\nMật khẩu: {STAFF_PASSWORD}")
+        st.caption("Đổi thông tin bằng biến môi trường trước khi triển khai thật.")
+
+    bookings = fetch_bookings()
+
+    if page == "Tổng quan":
+        st.subheader("📊 Tổng quan khách sạn")
+        with get_conn() as conn:
+            room_count = conn.execute("SELECT COUNT(*) FROM rooms").fetchone()[0]
+            occupied = conn.execute("SELECT COUNT(*) FROM rooms WHERE status='Đang có khách'").fetchone()[0]
+            reserved = conn.execute("SELECT COUNT(*) FROM rooms WHERE status='Đã đặt'").fetchone()[0]
+            revenue = conn.execute("SELECT COALESCE(SUM(total),0) FROM bookings WHERE payment_status='Đã thanh toán'").fetchone()[0]
+            booking_count = conn.execute("SELECT COUNT(*) FROM bookings").fetchone()[0]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Tổng số phòng", room_count)
+        c2.metric("Đang có khách", occupied)
+        c3.metric("Đã đặt trước", reserved)
+        c4.metric("Doanh thu đã thanh toán", money(revenue))
+        c5, c6 = st.columns(2)
+        c5.metric("Tổng lượt đặt phòng", booking_count)
+        c6.metric("Tỷ lệ phòng đang có khách", f"{occupied / room_count * 100:.1f}%" if room_count else "0%")
+        st.subheader("📌 Các đặt phòng gần đây")
+        if bookings:
+            st.dataframe([dict(b) for b in bookings[:10]], use_container_width=True, hide_index=True)
+        else:
+            st.info("Chưa có đặt phòng.")
+
+    elif page == "Đặt phòng":
+        st.subheader("🛎️ Đặt phòng khách sạn")
+        with st.form("booking_form", clear_on_submit=False):
+            col1, col2 = st.columns(2)
+            name = col1.text_input("Họ và tên *")
+            phone = col2.text_input("Số điện thoại *")
+            email = col1.text_input("Email")
+            guests = col2.number_input("Số khách", min_value=1, max_value=10, value=2)
+            today = date.today()
+            col3, col4 = st.columns(2)
+            checkin = col3.date_input("Ngày nhận phòng", value=today + timedelta(days=1), min_value=today)
+            checkout = col4.date_input("Ngày trả phòng", value=today + timedelta(days=2), min_value=today + timedelta(days=1))
+            room_type = st.selectbox("Loại phòng", ["Tất cả"] + list(ROOM_TYPES.keys()))
+            submitted_search = st.form_submit_button("🔎 Tìm phòng trống")
+        if submitted_search:
+            if checkout <= checkin:
+                st.error("Ngày trả phòng phải sau ngày nhận phòng.")
+            else:
+                options = available_rooms(checkin, checkout, room_type, int(guests))
+                st.session_state["available_room_ids"] = [r["id"] for r in options]
+                st.session_state["booking_search"] = {
+                    "checkin": checkin.isoformat(), "checkout": checkout.isoformat(),
+                    "guests": int(guests), "name": name, "phone": phone, "email": email
                 }
-
-                selected_label = st.selectbox(
-                    "Chọn phòng",
-                    list(options.keys()),
-                )
-
-                selected_room = options[selected_label]
-                nights = (checkout - checkin).days
-                total = selected_room["price"] * nights
-
-                st.markdown(f"### Tổng tiền dự kiến: {money(total)}")
-                st.caption(
-                    f"{nights} đêm × {money(selected_room['price'])}/đêm"
-                )
-
-                if st.button(
-                    "✅ Gửi yêu cầu đặt phòng",
-                    type="primary",
-                    use_container_width=True,
-                ):
-                    ok, result = create_booking(
-                        customer_name,
-                        phone,
-                        email,
-                        selected_room["id"],
-                        checkin,
-                        checkout,
-                        int(guests),
-                        note,
-                    )
-
-                    if ok:
-                        st.success("Đặt phòng thành công!")
-                        st.markdown(f"## Mã đặt phòng: `{result}`")
-                        st.info(
-                            "Đơn đang chờ nhân viên xác nhận. "
-                            "Hãy lưu mã để tra cứu và trò chuyện."
+                if options:
+                    st.success(f"Tìm thấy {len(options)} phòng phù hợp.")
+                else:
+                    st.warning("Không có phòng trống phù hợp trong khoảng ngày đã chọn.")
+        room_ids = st.session_state.get("available_room_ids", [])
+        search = st.session_state.get("booking_search")
+        if room_ids and search:
+            with get_conn() as conn:
+                placeholders = ",".join("?" for _ in room_ids)
+                options = conn.execute(f"SELECT * FROM rooms WHERE id IN ({placeholders}) ORDER BY room_number", room_ids).fetchall()
+            labels = {r["id"]: f"Phòng {r['room_number']} • {r['room_type']} • {money(r['price'])}/đêm • tối đa {r['capacity']} khách" for r in options}
+            selected = st.selectbox("Chọn phòng", list(labels), format_func=lambda x: labels[x])
+            nights = (date.fromisoformat(search["checkout"]) - date.fromisoformat(search["checkin"])).days
+            selected_room = next(r for r in options if r["id"] == selected)
+            st.info(f"Thời gian: {nights} đêm • Tổng tiền: **{money(selected_room['price'] * nights)}**")
+            if st.button("✅ Xác nhận đặt phòng", type="primary"):
+                if not search["name"].strip() or not search["phone"].strip():
+                    st.error("Vui lòng nhập họ tên và số điện thoại trước khi tìm phòng.")
+                else:
+                    try:
+                        code, total = create_booking(
+                            search["name"], search["phone"], search["email"], selected,
+                            date.fromisoformat(search["checkin"]), date.fromisoformat(search["checkout"]),
+                            search["guests"]
                         )
-                    else:
-                        st.error(result)
+                        st.success(f"Đặt phòng thành công! Mã đặt phòng: **{code}**. Tổng tiền: **{money(total)}**. Vui lòng lưu mã để tra cứu.")
+                        st.session_state.pop("available_room_ids", None)
+                    except ValueError as e:
+                        st.error(str(e))
 
+    elif page == "Sơ đồ phòng":
+        st.subheader("🗺️ Sơ đồ phòng")
+        st.caption("🟢 Trống  •  🔴 Đang có khách  •  🟠 Đã đặt  •  ⚫ Bảo trì")
+        with get_conn() as conn:
+            rooms = conn.execute("SELECT * FROM rooms ORDER BY room_number").fetchall()
+        cols = st.columns(4)
+        for i, room in enumerate(rooms):
+            color = {"Trống": "#d8f3dc", "Đang có khách": "#ffd6d6", "Đã đặt": "#ffe8b3", "Bảo trì": "#dddddd"}.get(room["status"], "#eeeeee")
+            with cols[i % 4]:
+                st.markdown(
+                    f"""<div style="background:{color};padding:18px;border-radius:12px;margin-bottom:12px;color:#222">
+                    <h3 style="margin:0">Phòng {room['room_number']}</h3>
+                    <b>{room['room_type']}</b><br>{money(room['price'])}/đêm<br>
+                    <b>{room['status']}</b><br>Sức chứa: {room['capacity']} khách
+                    </div>""", unsafe_allow_html=True
+                )
 
-# =========================================================
-# 14. TRA CỨU ĐẶT PHÒNG
-# =========================================================
+    elif page == "Thông tin đặt phòng":
+        st.subheader("🔎 Tra cứu thông tin đặt phòng")
+        code = st.text_input("Nhập mã đặt phòng")
+        phone = st.text_input("Số điện thoại dùng khi đặt phòng")
+        if st.button("Tra cứu"):
+            with get_conn() as conn:
+                result = conn.execute("""
+                    SELECT b.*, r.room_number, r.room_type FROM bookings b
+                    JOIN rooms r ON r.id=b.room_id
+                    WHERE upper(b.booking_code)=upper(?) AND b.phone=?
+                """, (code.strip(), phone.strip())).fetchone()
+            if result:
+                st.success("Tìm thấy thông tin đặt phòng.")
+                a, b = st.columns(2)
+                a.write(f"**Mã đặt phòng:** {result['booking_code']}")
+                a.write(f"**Khách hàng:** {result['customer_name']}")
+                a.write(f"**Phòng:** {result['room_number']} – {result['room_type']}")
+                a.write(f"**Ngày nhận:** {result['checkin']}")
+                b.write(f"**Ngày trả:** {result['checkout']}")
+                b.write(f"**Số đêm:** {result['nights']}")
+                b.write(f"**Tổng tiền:** {money(result['total'])}")
+                b.write(f"**Trạng thái:** {result['status']}")
+                b.write(f"**Thanh toán:** {result['payment_status']}")
+            else:
+                st.error("Không tìm thấy đặt phòng. Vui lòng kiểm tra lại mã và số điện thoại.")
+        st.divider()
+        st.markdown("**Các đặt phòng mẫu (dành cho trình diễn):**")
+        st.dataframe([{"Mã": b["booking_code"], "Khách hàng": b["customer_name"], "Phòng": b["room_number"],
+                       "Nhận phòng": b["checkin"], "Trả phòng": b["checkout"], "Tổng tiền": money(b["total"]),
+                       "Trạng thái": b["status"], "Thanh toán": b["payment_status"]} for b in bookings],
+                     use_container_width=True, hide_index=True)
 
-elif page == "🔎 Tra cứu đặt phòng":
-    st.title("🔎 Tra cứu đặt phòng")
+    elif page == "Chat với AI":
+        st.subheader("🤖 Trợ lý AI tư vấn khách sạn")
+        st.caption("Nếu chưa cấu hình API key, chatbot sẽ trả lời bằng các câu trả lời mẫu.")
+        if "ai_messages" not in st.session_state:
+            st.session_state.ai_messages = []
+        for msg in st.session_state.ai_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+        prompt = st.chat_input("Nhập câu hỏi về giá phòng, dịch vụ hoặc cách đặt phòng...")
+        if prompt:
+            st.session_state.ai_messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            answer = ai_reply(prompt)
+            st.session_state.ai_messages.append({"role": "assistant", "content": answer})
+            with st.chat_message("assistant"):
+                st.markdown(answer)
 
-    code = st.text_input("Nhập mã đặt phòng")
+    elif page == "Chat với nhân viên":
+        st.subheader("💬 Trao đổi với nhân viên")
+        code = st.text_input("Mã đặt phòng của bạn")
+        if code:
+            with get_conn() as conn:
+                exists = conn.execute("SELECT booking_code FROM bookings WHERE upper(booking_code)=upper(?)", (code.strip(),)).fetchone()
+                messages = conn.execute("SELECT * FROM messages WHERE upper(booking_code)=upper(?) ORDER BY id", (code.strip(),)).fetchall()
+            if not exists:
+                st.warning("Mã đặt phòng chưa đúng. Hãy kiểm tra lại trong mục Thông tin đặt phòng.")
+            else:
+                for msg in messages:
+                    with st.chat_message("assistant" if msg["sender"] == "Nhân viên" else "user"):
+                        st.caption(f"{msg['sender']} • {msg['created_at']}")
+                        st.write(msg["message"])
+                message = st.chat_input("Nhập tin nhắn gửi nhân viên...")
+                if message:
+                    with get_conn() as conn:
+                        conn.execute("INSERT INTO messages(booking_code,sender,message,created_at) VALUES(?,?,?,?)",
+                                     (code.strip().upper(), "Khách hàng", message, datetime.now().strftime("%Y-%m-%d %H:%M")))
+                    st.rerun()
 
-    if st.button("Tra cứu", use_container_width=True):
-        booking = get_booking(code)
-
-        if booking:
-            show_booking(booking)
-        else:
-            st.error("Không tìm thấy đơn đặt phòng.")
-
-
-# =========================================================
-# 15. CHAT VỚI NHÂN VIÊN
-# =========================================================
-
-elif page == "💬 Chat với nhân viên":
-    st.title("💬 Chat với nhân viên")
-
-    code = st.text_input(
-        "Mã đặt phòng",
-        value=st.session_state.customer_chat_code,
-    )
-
-    if st.button("Mở cuộc trò chuyện"):
-        booking = get_booking(code)
-
-        if booking:
-            st.session_state.customer_chat_code = code.strip().upper()
-            st.rerun()
-        else:
-            st.error("Mã đặt phòng không hợp lệ.")
-
-    code = st.session_state.customer_chat_code
-
-    if code:
-        booking = get_booking(code)
-
-        if booking:
-            st.success(
-                f"Đơn {code} · Phòng {booking['room_number']}"
-            )
-
-            chat_interface(
-                code,
-                sender="customer",
-                sender_name=booking["customer_name"],
-            )
-
-
-# =========================================================
-# 16. CHATBOX AI
-# =========================================================
-
-elif page == "🤖 Chatbox AI":
-    st.title("🤖 Trợ lý AI khách sạn")
-
-    st.caption(
-        "Hỏi về loại phòng, giá phòng, sức chứa và cách đặt phòng."
-    )
-
-    if get_api_key() and OpenAI is not None:
-        st.success("Đã cấu hình OpenAI API.")
-    else:
-        st.info("Đang chạy chế độ minh họa.")
-
-    for item in st.session_state.ai_history:
-        with st.chat_message(item["role"]):
-            st.markdown(item["content"])
-
-    prompt = st.chat_input("Nhập câu hỏi của bạn...")
-
-    if prompt:
-        st.session_state.ai_history.append({
-            "role": "user",
-            "content": prompt,
-        })
-
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.chat_message("assistant"):
-            with st.spinner("AI đang trả lời..."):
-                answer = ai_answer(prompt)
-            st.markdown(answer)
-
-        st.session_state.ai_history.append({
-            "role": "assistant",
-            "content": answer,
-        })
-
-    if st.session_state.ai_history:
-        if st.button("🧹 Xóa lịch sử trò chuyện AI"):
-            st.session_state.ai_history = []
-            st.rerun()
-
-
-# =========================================================
-# 17. QUẢN LÝ NHÂN VIÊN
-# =========================================================
-
-elif page == "👨‍💼 Quản lý nhân viên":
-    st.title("👨‍💼 Khu vực nhân viên")
-
-    if not st.session_state.staff_logged_in:
-        st.warning("Vui lòng đăng nhập.")
-
-        with st.form("staff_login"):
-            password = st.text_input("Mật khẩu", type="password")
-            login = st.form_submit_button("Đăng nhập")
-
+    elif page == "Quản trị nhân viên":
+        st.subheader("🔐 Khu vực nhân viên")
+        if not st.session_state.get("staff_logged_in"):
+            with st.form("staff_login"):
+                user = st.text_input("Tài khoản")
+                password = st.text_input("Mật khẩu", type="password")
+                login = st.form_submit_button("Đăng nhập")
             if login:
-                if password == STAFF_PASSWORD:
+                if user == STAFF_USER and password == STAFF_PASSWORD:
                     st.session_state.staff_logged_in = True
                     st.rerun()
                 else:
-                    st.error("Mật khẩu không đúng.")
-
-    else:
-        if st.button("Đăng xuất"):
-            st.session_state.staff_logged_in = False
-            st.rerun()
-
-        bookings = get_bookings()
-
-        c1, c2, c3 = st.columns(3)
-
-        c1.metric("Tổng đơn", len(bookings))
-        c2.metric(
-            "Chờ xác nhận",
-            int((bookings["status"] == "Chờ xác nhận").sum())
-            if not bookings.empty else 0,
-        )
-        c3.metric(
-            "Đã xác nhận",
-            int((bookings["status"] == "Đã xác nhận").sum())
-            if not bookings.empty else 0,
-        )
-
-        st.subheader("📋 Danh sách đặt phòng")
-
-        if bookings.empty:
-            st.info("Chưa có đơn đặt phòng.")
+                    st.error("Sai tài khoản hoặc mật khẩu.")
         else:
-            st.dataframe(
-                bookings[[
-                    "code", "customer_name", "phone",
-                    "room_number", "room_type", "checkin",
-                    "checkout", "guests", "total", "status",
-                ]].rename(columns={
-                    "code": "Mã đơn",
-                    "customer_name": "Khách hàng",
-                    "phone": "Điện thoại",
-                    "room_number": "Phòng",
-                    "room_type": "Loại phòng",
-                    "checkin": "Ngày nhận",
-                    "checkout": "Ngày trả",
-                    "guests": "Số khách",
-                    "total": "Tổng tiền",
-                    "status": "Trạng thái",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.divider()
-            st.subheader("🔄 Xử lý đơn đặt phòng")
-
-            booking_options = {
-                (
-                    f"{r['code']} | Phòng {r['room_number']} | "
-                    f"{r['customer_name']} | {r['status']}"
-                ): r["code"]
-                for _, r in bookings.iterrows()
-            }
-
-            selected_label = st.selectbox(
-                "Chọn đơn",
-                list(booking_options.keys()),
-            )
-
-            selected_code = booking_options[selected_label]
-            booking = get_booking(selected_code)
-
-            show_booking(booking)
-
-            new_status = st.selectbox(
-                "Trạng thái mới",
-                STATUSES,
-                index=STATUSES.index(booking["status"]),
-            )
-
-            if st.button("💾 Cập nhật trạng thái"):
-                ok, message = update_booking_status(
-                    selected_code, new_status
-                )
-
-                if ok:
-                    st.success(message)
+            if st.button("Đăng xuất"):
+                st.session_state.staff_logged_in = False
+                st.rerun()
+            st.markdown("### Quản lý đặt phòng")
+            with get_conn() as conn:
+                all_bookings = conn.execute("""
+                    SELECT b.*, r.room_number, r.room_type FROM bookings b
+                    JOIN rooms r ON r.id=b.room_id ORDER BY b.id DESC
+                """).fetchall()
+            if all_bookings:
+                st.dataframe([{"Mã": b["booking_code"], "Khách": b["customer_name"], "Điện thoại": b["phone"],
+                               "Phòng": b["room_number"], "Nhận": b["checkin"], "Trả": b["checkout"],
+                               "Tổng tiền": money(b["total"]), "Trạng thái": b["status"],
+                               "Thanh toán": b["payment_status"]} for b in all_bookings],
+                             use_container_width=True, hide_index=True)
+                chosen = st.selectbox("Chọn mã đặt phòng để cập nhật", [b["booking_code"] for b in all_bookings])
+                current = next(b for b in all_bookings if b["booking_code"] == chosen)
+                with st.form("update_booking"):
+                    status = st.selectbox("Trạng thái đặt phòng", ["Đã xác nhận", "Đang ở", "Đã trả phòng", "Đã hủy"],
+                                          index=["Đã xác nhận", "Đang ở", "Đã trả phòng", "Đã hủy"].index(current["status"]))
+                    payment = st.selectbox("Thanh toán", ["Chưa thanh toán", "Đã thanh toán"],
+                                           index=["Chưa thanh toán", "Đã thanh toán"].index(current["payment_status"]))
+                    update = st.form_submit_button("Lưu cập nhật")
+                if update:
+                    with get_conn() as conn:
+                        conn.execute("UPDATE bookings SET status=?, payment_status=? WHERE booking_code=?",
+                                     (status, payment, chosen))
+                    refresh_room_statuses()
+                    st.success("Đã cập nhật đặt phòng.")
                     st.rerun()
-                else:
-                    st.error(message)
+            st.markdown("### Tin nhắn khách hàng")
+            with get_conn() as conn:
+                messages = conn.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 100").fetchall()
+            if not messages:
+                st.info("Chưa có tin nhắn.")
+            else:
+                for msg in reversed(messages):
+                    st.markdown(f"**{msg['booking_code']} | {msg['sender']} | {msg['created_at']}**")
+                    st.write(msg["message"])
+                    if msg["sender"] == "Khách hàng":
+                        with st.form(f"reply_{msg['id']}"):
+                            reply = st.text_input("Phản hồi", key=f"reply_text_{msg['id']}")
+                            send = st.form_submit_button("Gửi phản hồi")
+                        if send and reply.strip():
+                            with get_conn() as conn:
+                                conn.execute("INSERT INTO messages(booking_code,sender,message,created_at) VALUES(?,?,?,?)",
+                                             (msg["booking_code"], "Nhân viên", reply.strip(),
+                                              datetime.now().strftime("%Y-%m-%d %H:%M")))
+                            st.success("Đã gửi phản hồi.")
+                            st.rerun()
 
-            st.divider()
+if __name__ == "__main__":
+    main()
 
-            st.subheader("💬 Trao đổi với khách hàng")
-
-            chat_interface(
-                selected_code,
-                sender="staff",
-                sender_name="Nhân viên",
-            )
-
-
-# =========================================================
-# 18. CHÂN TRANG
-# =========================================================
-
-st.divider()
-st.caption(
-    "Hotel Booking | Đặt phòng khách sạn, sơ đồ phòng, "
-    "Chatbox AI và hỗ trợ khách hàng"
-)
